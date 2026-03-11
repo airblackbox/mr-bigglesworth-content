@@ -1,614 +1,671 @@
 # Build a DVR for AI Agents: Episode Replay UI That Actually Works
 
-Your AI agent made 47 LLM calls, spent $3.20 on tokens, and still couldn't book a restaurant reservation — but you have no idea which call broke the logic chain.
+**Your AI agent made 47 LLM calls, burned $12, and returned "I don't know" — and you have zero visibility into what went wrong at call #23.**
 
-## The Problem: AI Agent Debugging is Still Cave Painting
+## The Problem: Debugging AI Agents Is Like Debugging Black Holes
 
-Here's what happens when your CrewAI agents go sideways at 2 AM:
+Every AI agent conversation is a story told through a sequence of LLM calls. But when things go wrong — and they will — you're left staring at logs that look like this:
 
-You get a stack trace that ends with `openai.BadRequestError` and a chat log that looks like this:
 ```
-Agent: I need to book a table
-LLM: I'll help you book a table
-Agent: Great, book it for 2 people
-LLM: I don't have access to restaurant booking
-Agent: But you just said you'd help
-LLM: I apologize for the confusion
-Agent: *spends $2.80 in circles*
+INFO: Agent started
+INFO: LLM call completed
+INFO: LLM call completed  
+INFO: LLM call completed
+ERROR: Task failed
 ```
 
-The current debugging experience is archaeological. You dig through logs, grep for error patterns, and try to reverse-engineer what your agent was "thinking" at step 23 of a 47-step conversation. It's like debugging a distributed system where every node has amnesia.
+Spectacular. Your agent made three calls and failed. Was it the prompt? The model temperature? A context window overflow? A hallucination at step 2 that poisoned everything downstream?
 
-What you need is a DVR for AI agents. Something that records every decision, lets you scrub through the timeline, and replay exactly what happened at each step. Not just the final output — the entire cognitive workflow.
+Traditional logging treats each LLM call as an isolated event. But AI agent conversations aren't isolated events — they're episodes with narrative flow, character development (your prompts), and plot twists (model responses). You need a DVR, not a logfile.
 
-## Architecture: Agent DVR with Timeline Scrubbing
+The current state of AI agent debugging:
+- **CloudWatch/Datadog**: Great for servers, useless for conversation flow
+- **Print statements**: Works until you hit production
+- **LLM provider dashboards**: Shows you the calls, not the story
+- **Memory**: Unreliable witness, especially at 3 AM
 
-Here's how we build a proper episode replay system:
+You need timeline scrubbing. You need to pause at call #23, see the exact prompt that went in, the response that came out, and the context that led to both. You need a DVR for AI episodes.
+
+## Architecture: How Episode Replay Actually Works
+
+Here's how we build a DVR that captures the full narrative arc of your AI agent conversations:
 
 ```mermaid
 graph TB
     subgraph "AI Agent Runtime"
-        A[CrewAI Agent] --> B[LangChain Tools]
-        B --> C[OpenAI API]
-        C --> D[Tool Results]
-        D --> A
+        A[AI Agent] --> B[Airblackbox Gateway]
+        B --> C[LLM Provider]
+        C --> B
+        B --> A
     end
     
-    subgraph "Airblackbox Recording Layer"
-        E[Gateway Proxy] --> F[Episode Recorder]
-        F --> G[Timeline Store]
-        G --> H[Event Index]
+    subgraph "Episode Storage"
+        B --> D[Episode Recorder]
+        D --> E[SQLite DB]
+        E --> F[Episode Index]
     end
     
     subgraph "DVR Interface"
-        I[Timeline Scrubber] --> J[Step Inspector]
-        J --> K[Decision Tree Viewer]
-        K --> L[Token Cost Tracker]
+        G[Timeline Scrubber] --> H[Episode Player]
+        H --> I[Call Inspector]
+        I --> J[Context Viewer]
     end
     
-    C --> E
-    G --> I
+    F --> G
     
-    subgraph "Debugging Features"
-        M[Replay Engine] --> N[State Diff Viewer]
-        N --> O[Breakpoint System]
-    end
-    
-    I --> M
+    style B fill:#ff9999
+    style E fill:#99ccff
+    style H fill:#99ff99
 ```
 
-The key insight: treat each agent conversation as a recorded "episode" with frame-by-frame navigation. Every LLM call becomes a timeline event with full context — prompt, response, reasoning, tool calls, and state changes.
+**Core Components:**
 
-## Implementation: Building the Agent DVR
+1. **Episode Recorder**: Captures every LLM call with full context, timestamps, and conversation threading
+2. **Timeline Index**: Builds a scrubable timeline from raw call data
+3. **Episode Player**: Renders the conversation flow with DVR controls
+4. **Context Viewer**: Shows the full prompt engineering context at any point
 
-### Step 1: Episode Recording Infrastructure
+The key insight: we're not just logging API calls. We're recording episodes with scene breaks, character development, and plot continuity.
 
-First, we need to capture every agent decision with full context:
+## Implementation: Building the DVR
+
+### Step 1: Set Up the Episode Recorder
+
+First, install Airblackbox and set up the recording infrastructure:
+
+```bash
+pip install airblackbox[gateway] fastapi uvicorn
+```
 
 ```python
-from datetime import datetime, timezone
-from dataclasses import dataclass, asdict
-from typing import List, Dict, Any, Optional
-import json
+# episode_recorder.py
 import sqlite3
-from pathlib import Path
+import json
+import time
+from datetime import datetime
+from typing import Dict, List, Optional
+from dataclasses import dataclass, asdict
+from uuid import uuid4
 
 @dataclass
-class AgentEvent:
-    timestamp: str
-    event_type: str  # 'llm_call', 'tool_call', 'decision', 'error'
-    agent_name: str
-    step_number: int
-    content: Dict[str, Any]
-    tokens_used: int
-    cost_cents: int
-    duration_ms: int
-    parent_event_id: Optional[str] = None
-    event_id: Optional[str] = None
+class EpisodeCall:
+    """A single LLM call within an episode"""
+    call_id: str
+    episode_id: str
+    timestamp: float
+    sequence: int
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    request_body: Dict
+    response_body: Dict
+    latency_ms: float
+    cost_estimate: float
 
 class EpisodeRecorder:
-    def __init__(self, db_path: str = "./agent_episodes.db"):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, db_path: str = "episodes.db"):
+        self.db_path = db_path
         self._init_db()
-        
+    
     def _init_db(self):
+        """Initialize the episode database"""
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS episodes (
                 episode_id TEXT PRIMARY KEY,
-                agent_name TEXT,
-                start_time TEXT,
-                end_time TEXT,
-                total_tokens INTEGER DEFAULT 0,
-                total_cost_cents INTEGER DEFAULT 0,
-                status TEXT DEFAULT 'running'
+                title TEXT,
+                created_at REAL,
+                updated_at REAL,
+                status TEXT,
+                total_calls INTEGER DEFAULT 0,
+                total_cost REAL DEFAULT 0.0
             )
         """)
         
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS events (
-                event_id TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS episode_calls (
+                call_id TEXT PRIMARY KEY,
                 episode_id TEXT,
-                timestamp TEXT,
-                event_type TEXT,
-                agent_name TEXT,
-                step_number INTEGER,
-                content TEXT,
-                tokens_used INTEGER,
-                cost_cents INTEGER,
-                duration_ms INTEGER,
-                parent_event_id TEXT,
+                timestamp REAL,
+                sequence INTEGER,
+                model TEXT,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                request_body TEXT,
+                response_body TEXT,
+                latency_ms REAL,
+                cost_estimate REAL,
                 FOREIGN KEY (episode_id) REFERENCES episodes (episode_id)
             )
         """)
         
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_events ON events(episode_id, step_number)")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_calls_episode_id 
+            ON episode_calls (episode_id)
+        """)
+        
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_episode_calls_sequence 
+            ON episode_calls (episode_id, sequence)
+        """)
+        
         conn.commit()
         conn.close()
     
-    def start_episode(self, agent_name: str) -> str:
-        episode_id = f"{agent_name}_{datetime.now(timezone.utc).isoformat()}"
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            "INSERT INTO episodes (episode_id, agent_name, start_time) VALUES (?, ?, ?)",
-            (episode_id, agent_name, datetime.now(timezone.utc).isoformat())
-        )
-        conn.commit()
-        conn.close()
-        return episode_id
-    
-    def record_event(self, episode_id: str, event: AgentEvent) -> str:
-        event_id = f"{episode_id}_{event.step_number}_{event.event_type}"
-        event.event_id = event_id
+    def start_episode(self, title: str = None) -> str:
+        """Start a new episode and return the episode ID"""
+        episode_id = str(uuid4())
+        if title is None:
+            title = f"Episode {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         
         conn = sqlite3.connect(self.db_path)
         conn.execute("""
-            INSERT INTO events 
-            (event_id, episode_id, timestamp, event_type, agent_name, step_number, 
-             content, tokens_used, cost_cents, duration_ms, parent_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            event_id, episode_id, event.timestamp, event.event_type,
-            event.agent_name, event.step_number, json.dumps(event.content),
-            event.tokens_used, event.cost_cents, event.duration_ms,
-            event.parent_event_id
-        ))
+            INSERT INTO episodes (episode_id, title, created_at, updated_at, status)
+            VALUES (?, ?, ?, ?, ?)
+        """, (episode_id, title, time.time(), time.time(), "recording"))
         conn.commit()
         conn.close()
-        return event_id
+        
+        return episode_id
+    
+    def record_call(self, episode_id: str, call_data: EpisodeCall):
+        """Record a single LLM call in the episode"""
+        conn = sqlite3.connect(self.db_path)
+        
+        # Insert the call
+        conn.execute("""
+            INSERT INTO episode_calls 
+            (call_id, episode_id, timestamp, sequence, model, prompt_tokens, 
+             completion_tokens, request_body, response_body, latency_ms, cost_estimate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            call_data.call_id,
+            call_data.episode_id,
+            call_data.timestamp,
+            call_data.sequence,
+            call_data.model,
+            call_data.prompt_tokens,
+            call_data.completion_tokens,
+            json.dumps(call_data.request_body),
+            json.dumps(call_data.response_body),
+            call_data.latency_ms,
+            call_data.cost_estimate
+        ))
+        
+        # Update episode stats
+        conn.execute("""
+            UPDATE episodes 
+            SET updated_at = ?, 
+                total_calls = total_calls + 1,
+                total_cost = total_cost + ?
+            WHERE episode_id = ?
+        """, (time.time(), call_data.cost_estimate, episode_id))
+        
+        conn.commit()
+        conn.close()
 ```
 
-### Step 2: LangChain Integration with Recording
-
-Now we instrument a LangChain agent to record every decision:
+### Step 2: Build the Timeline Scrubber
 
 ```python
-from langchain.agents import AgentExecutor, create_openai_functions_agent
-from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.tools import Tool
-import time
-from typing import Dict, Any
-
-class RecordingAgent:
-    def __init__(self, recorder: EpisodeRecorder, tools: List[Tool]):
-        self.recorder = recorder
-        self.episode_id = None
-        self.step_counter = 0
-        
-        # Create LangChain agent
-        self.llm = ChatOpenAI(temperature=0)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful assistant that uses tools to complete tasks."),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}")
-        ])
-        
-        agent = create_openai_functions_agent(self.llm, tools, prompt)
-        self.executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-        
-        # Hook into the execution flow
-        self._monkey_patch_executor()
-    
-    def _monkey_patch_executor(self):
-        original_plan = self.executor.agent.plan
-        original_llm_call = self.llm._generate
-        
-        def recording_plan(intermediate_steps, callbacks, **kwargs):
-            start_time = time.time()
-            self.step_counter += 1
-            
-            try:
-                result = original_plan(intermediate_steps, callbacks, **kwargs)
-                
-                # Record the planning step
-                self.recorder.record_event(self.episode_id, AgentEvent(
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    event_type="agent_plan",
-                    agent_name="langchain_agent",
-                    step_number=self.step_counter,
-                    content={
-                        "input": kwargs.get("input", ""),
-                        "intermediate_steps": [str(step) for step in intermediate_steps],
-                        "plan": str(result)
-                    },
-                    tokens_used=0,  # Filled by LLM hook
-                    cost_cents=0,   # Filled by LLM hook
-                    duration_ms=int((time.time() - start_time) * 1000)
-                ))
-                
-                return result
-            except Exception as e:
-                self.recorder.record_event(self.episode_id, AgentEvent(
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                    event_type="error",
-                    agent_name="langchain_agent",
-                    step_number=self.step_counter,
-                    content={"error": str(e), "type": type(e).__name__},
-                    tokens_used=0,
-                    cost_cents=0,
-                    duration_ms=int((time.time() - start_time) * 1000)
-                ))
-                raise
-        
-        self.executor.agent.plan = recording_plan
-    
-    def run_episode(self, task: str) -> str:
-        self.episode_id = self.recorder.start_episode("langchain_agent")
-        
-        try:
-            result = self.executor.invoke({"input": task})
-            
-            # Mark episode as completed
-            conn = sqlite3.connect(self.recorder.db_path)
-            conn.execute(
-                "UPDATE episodes SET end_time = ?, status = ? WHERE episode_id = ?",
-                (datetime.now(timezone.utc).isoformat(), "completed", self.episode_id)
-            )
-            conn.commit()
-            conn.close()
-            
-            return result
-            
-        except Exception as e:
-            # Mark episode as failed
-            conn = sqlite3.connect(self.recorder.db_path)
-            conn.execute(
-                "UPDATE episodes SET end_time = ?, status = ? WHERE episode_id = ?",
-                (datetime.now(timezone.utc).isoformat(), "failed", self.episode_id)
-            )
-            conn.commit()
-            conn.close()
-            raise
-```
-
-### Step 3: Timeline Scrubber Interface
-
-Now for the DVR interface — a web UI that lets you scrub through agent decisions:
-
-```python
-from flask import Flask, render_template, jsonify, request
+# timeline_scrubber.py
+from typing import List, Optional
 import sqlite3
 import json
-from typing import List, Dict
 
-class AgentDVR:
-    def __init__(self, db_path: str):
+class TimelineScrubber:
+    def __init__(self, db_path: str = "episodes.db"):
         self.db_path = db_path
-        self.app = Flask(__name__)
-        self._setup_routes()
     
-    def _setup_routes(self):
-        @self.app.route('/')
-        def index():
-            return render_template('dvr.html')
+    def get_episode_timeline(self, episode_id: str) -> List[Dict]:
+        """Get the full timeline for an episode"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
         
-        @self.app.route('/api/episodes')
-        def get_episodes():
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.execute("""
-                SELECT episode_id, agent_name, start_time, end_time, 
-                       total_tokens, total_cost_cents, status,
-                       COUNT(events.event_id) as event_count
-                FROM episodes 
-                LEFT JOIN events ON episodes.episode_id = events.episode_id
-                GROUP BY episode_id
-                ORDER BY start_time DESC
-                LIMIT 50
-            """)
-            
-            episodes = []
-            for row in cursor.fetchall():
-                episodes.append({
-                    'episode_id': row[0],
-                    'agent_name': row[1],
-                    'start_time': row[2],
-                    'end_time': row[3],
-                    'total_tokens': row[4],
-                    'total_cost_cents': row[5],
-                    'status': row[6],
-                    'event_count': row[7]
-                })
-            
-            conn.close()
-            return jsonify(episodes)
+        cursor = conn.execute("""
+            SELECT * FROM episode_calls 
+            WHERE episode_id = ? 
+            ORDER BY sequence ASC
+        """, (episode_id,))
         
-        @self.app.route('/api/episodes/<episode_id>/timeline')
-        def get_timeline(episode_id):
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.execute("""
-                SELECT event_id, timestamp, event_type, step_number, content,
-                       tokens_used, cost_cents, duration_ms
-                FROM events 
-                WHERE episode_id = ?
-                ORDER BY step_number
-            """, (episode_id,))
-            
-            timeline = []
-            for row in cursor.fetchall():
-                timeline.append({
-                    'event_id': row[0],
-                    'timestamp': row[1],
-                    'event_type': row[2],
-                    'step_number': row[3],
-                    'content': json.loads(row[4]),
-                    'tokens_used': row[5],
-                    'cost_cents': row[6],
-                    'duration_ms': row[7]
-                })
-            
-            conn.close()
-            return jsonify(timeline)
+        timeline = []
+        for row in cursor.fetchall():
+            timeline.append({
+                'call_id': row['call_id'],
+                'sequence': row['sequence'],
+                'timestamp': row['timestamp'],
+                'model': row['model'],
+                'prompt_tokens': row['prompt_tokens'],
+                'completion_tokens': row['completion_tokens'],
+                'request_body': json.loads(row['request_body']),
+                'response_body': json.loads(row['response_body']),
+                'latency_ms': row['latency_ms'],
+                'cost_estimate': row['cost_estimate']
+            })
         
-        @self.app.route('/api/episodes/<episode_id>/step/<int:step>')
-        def get_step_detail(episode_id, step):
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.execute("""
-                SELECT * FROM events 
-                WHERE episode_id = ? AND step_number = ?
-            """, (episode_id, step))
-            
-            row = cursor.fetchone()
-            if not row:
-                return jsonify({'error': 'Step not found'}), 404
-            
-            step_detail = {
-                'event_id': row[0],
-                'timestamp': row[2],
-                'event_type': row[3],
-                'content': json.loads(row[6]),
-                'tokens_used': row[7],
-                'cost_cents': row[8],
-                'duration_ms': row[9]
+        conn.close()
+        return timeline
+    
+    def scrub_to_call(self, episode_id: str, call_sequence: int) -> Optional[Dict]:
+        """Scrub to a specific call in the timeline"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        
+        cursor = conn.execute("""
+            SELECT * FROM episode_calls 
+            WHERE episode_id = ? AND sequence = ?
+        """, (episode_id, call_sequence))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            return None
+        
+        return {
+            'call_id': row['call_id'],
+            'sequence': row['sequence'],
+            'timestamp': row['timestamp'],
+            'model': row['model'],
+            'prompt': self._extract_prompt(json.loads(row['request_body'])),
+            'response': self._extract_response(json.loads(row['response_body'])),
+            'metadata': {
+                'prompt_tokens': row['prompt_tokens'],
+                'completion_tokens': row['completion_tokens'],
+                'latency_ms': row['latency_ms'],
+                'cost_estimate': row['cost_estimate']
             }
-            
-            conn.close()
-            return jsonify(step_detail)
+        }
     
-    def run(self, debug=True, port=5000):
-        self.app.run(debug=debug, port=port)
+    def _extract_prompt(self, request_body: Dict) -> str:
+        """Extract the actual prompt from the request body"""
+        if 'messages' in request_body:
+            # Chat completion format
+            messages = request_body['messages']
+            if messages:
+                return messages[-1].get('content', '')
+        elif 'prompt' in request_body:
+            # Text completion format
+            return request_body['prompt']
+        return "No prompt found"
+    
+    def _extract_response(self, response_body: Dict) -> str:
+        """Extract the actual response from the response body"""
+        if 'choices' in response_body and response_body['choices']:
+            choice = response_body['choices'][0]
+            if 'message' in choice:
+                return choice['message'].get('content', '')
+            elif 'text' in choice:
+                return choice['text']
+        return "No response found"
 ```
 
-### Step 4: Frontend Timeline Scrubber
+### Step 3: Create the DVR Interface
 
-Here's the HTML interface with timeline scrubbing:
+```python
+# dvr_interface.py
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+import uvicorn
+
+app = FastAPI(title="AI Agent DVR")
+templates = Jinja2Templates(directory="templates")
+
+@app.get("/episodes", response_class=HTMLResponse)
+async def list_episodes(request: Request):
+    """List all recorded episodes"""
+    conn = sqlite3.connect("episodes.db")
+    conn.row_factory = sqlite3.Row
+    
+    cursor = conn.execute("""
+        SELECT * FROM episodes 
+        ORDER BY created_at DESC
+    """)
+    
+    episodes = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    
+    return templates.TemplateResponse("episodes.html", {
+        "request": request,
+        "episodes": episodes
+    })
+
+@app.get("/episodes/{episode_id}", response_class=HTMLResponse)
+async def view_episode(request: Request, episode_id: str):
+    """View a specific episode with DVR controls"""
+    scrubber = TimelineScrubber()
+    timeline = scrubber.get_episode_timeline(episode_id)
+    
+    return templates.TemplateResponse("episode_player.html", {
+        "request": request,
+        "episode_id": episode_id,
+        "timeline": timeline
+    })
+
+@app.get("/episodes/{episode_id}/call/{sequence}")
+async def get_call_details(episode_id: str, sequence: int):
+    """Get detailed view of a specific call"""
+    scrubber = TimelineScrubber()
+    call_data = scrubber.scrub_to_call(episode_id, sequence)
+    
+    if not call_data:
+        return {"error": "Call not found"}
+    
+    return call_data
+
+# Wire up to Airblackbox Gateway
+from airblackbox import GatewayRecorder
+
+recorder = EpisodeRecorder()
+
+@app.middleware("http")
+async def record_episode_middleware(request: Request, call_next):
+    """Middleware to record LLM calls as episodes"""
+    response = await call_next(request)
+    
+    # This is where you'd integrate with Airblackbox Gateway
+    # to capture and record the actual LLM calls
+    
+    return response
+```
+
+### Step 4: Build the Frontend DVR Controls
+
+Create `templates/episode_player.html`:
 
 ```html
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Agent DVR - Episode Replay</title>
-    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <title>Episode Player - AI Agent DVR</title>
     <style>
-        .timeline-container { margin: 20px 0; }
-        .timeline-scrubber { 
-            width: 100%; 
-            height: 40px; 
-            background: #f0f0f0; 
-            position: relative;
-            cursor: pointer;
+        .timeline-scrubber {
+            width: 100%;
+            margin: 20px 0;
         }
-        .timeline-event {
-            position: absolute;
-            height: 100%;
-            border-left: 2px solid;
+        
+        .call-marker {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            background: #007bff;
+            margin: 2px;
             cursor: pointer;
+            border-radius: 3px;
         }
-        .event-llm { border-color: #007acc; }
-        .event-tool { border-color: #ff6b35; }
-        .event-error { border-color: #ff1744; }
-        .step-detail {
-            background: #f9f9f9;
+        
+        .call-marker.error {
+            background: #dc3545;
+        }
+        
+        .call-marker.active {
+            background: #28a745;
+            transform: scale(1.2);
+        }
+        
+        .call-details {
+            border: 1px solid #ddd;
             padding: 20px;
-            margin: 10px 0;
-            border-radius: 4px;
+            margin: 20px 0;
+            border-radius: 5px;
         }
+        
+        .prompt, .response {
+            background: #f8f9fa;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 3px;
+            white-space: pre-wrap;
+        }
+        
+        .controls {
+            margin: 20px 0;
+        }
+        
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        
+        .play { background: #28a745; color: white; }
+        .pause { background: #ffc107; }
+        .stop { background: #dc3545; color: white; }
     </style>
 </head>
 <body>
-    <div id="dvr-root"></div>
+    <h1>Episode Player: {{ episode_id }}</h1>
+    
+    <div class="controls">
+        <button class="play" onclick="playEpisode()">▶ Play</button>
+        <button class="pause" onclick="pauseEpisode()">⏸ Pause</button>
+        <button class="stop" onclick="stopEpisode()">⏹ Stop</button>
+        <span id="playback-status">Ready</span>
+    </div>
+    
+    <div class="timeline-scrubber">
+        <h3>Timeline ({{ timeline|length }} calls)</h3>
+        {% for call in timeline %}
+        <div class="call-marker" 
+             data-sequence="{{ call.sequence }}"
+             data-call-id="{{ call.call_id }}"
+             onclick="scrubToCall({{ call.sequence }})">
+        </div>
+        {% endfor %}
+    </div>
+    
+    <div id="call-details" class="call-details" style="display: none;">
+        <h3>Call <span id="call-sequence"></span></h3>
+        <div class="metadata">
+            <strong>Model:</strong> <span id="call-model"></span><br>
+            <strong>Latency:</strong> <span id="call-latency"></span>ms<br>
+            <strong>Cost:</strong> $<span id="call-cost"></span><br>
+            <strong>Tokens:</strong> <span id="call-tokens"></span>
+        </div>
+        
+        <h4>Prompt</h4>
+        <div class="prompt" id="call-prompt"></div>
+        
+        <h4>Response</h4>
+        <div class="response" id="call-response"></div>
+    </div>
 
-    <script type="text/babel">
-        const AgentDVR = () => {
-            const [episodes, setEpisodes] = React.useState([]);
-            const [selectedEpisode, setSelectedEpisode] = React.useState(null);
-            const [timeline, setTimeline] = React.useState([]);
-            const [currentStep, setCurrentStep] = React.useState(0);
-            const [stepDetail, setStepDetail] = React.useState(null);
-
-            React.useEffect(() => {
-                fetch('/api/episodes')
-                    .then(r => r.json())
-                    .then(setEpisodes);
-            }, []);
-
-            const loadEpisode = async (episodeId) => {
-                const timelineRes = await fetch(`/api/episodes/${episodeId}/timeline`);
-                const timelineData = await timelineRes.json();
-                
-                setSelectedEpisode(episodeId);
-                setTimeline(timelineData);
-                setCurrentStep(0);
-                loadStepDetail(episodeId, 0);
-            };
-
-            const loadStepDetail = async (episodeId, step) => {
-                if (timeline[step]) {
-                    const detailRes = await fetch(`/api/episodes/${episodeId}/step/${step + 1}`);
-                    const detail = await detailRes.json();
-                    setStepDetail(detail);
-                    setCurrentStep(step);
+    <script>
+        let currentCall = 0;
+        let isPlaying = false;
+        let playbackTimer = null;
+        
+        function scrubToCall(sequence) {
+            currentCall = sequence;
+            loadCallDetails(sequence);
+            updateMarkers();
+        }
+        
+        function loadCallDetails(sequence) {
+            fetch(`/episodes/{{ episode_id }}/call/${sequence}`)
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('call-sequence').textContent = data.sequence;
+                    document.getElementById('call-model').textContent = data.model;
+                    document.getElementById('call-latency').textContent = data.metadata.latency_ms;
+                    document.getElementById('call-cost').textContent = data.metadata.cost_estimate;
+                    document.getElementById('call-tokens').textContent = 
+                        `${data.metadata.prompt_tokens} → ${data.metadata.completion_tokens}`;
+                    document.getElementById('call-prompt').textContent = data.prompt;
+                    document.getElementById('call-response').textContent = data.response;
+                    document.getElementById('call-details').style.display = 'block';
+                });
+        }
+        
+        function updateMarkers() {
+            document.querySelectorAll('.call-marker').forEach(marker => {
+                marker.classList.remove('active');
+                if (parseInt(marker.dataset.sequence) === currentCall) {
+                    marker.classList.add('active');
                 }
-            };
-
-            const TimelineScrubber = ({ timeline, onStepSelect }) => {
-                const handleClick = (e) => {
-                    const rect = e.target.getBoundingClientRect();
-                    const x = e.clientX - rect.left;
-                    const step = Math.floor((x / rect.width) * timeline.length);
-                    onStepSelect(Math.max(0, Math.min(step, timeline.length - 1)));
-                };
-
-                return (
-                    <div className="timeline-container">
-                        <div className="timeline-scrubber" onClick={handleClick}>
-                            {timeline.map((event, i) => (
-                                <div
-                                    key={event.event_id}
-                                    className={`timeline-event event-${event.event_type}`}
-                                    style={{
-                                        left: `${(i / timeline.length) * 100}%`,
-                                        width: `${100 / timeline.length}%`
-                                    }}
-                                    title={`Step ${i + 1}: ${event.event_type}`}
-                                />
-                            ))}
-                        </div>
-                        <div>Step {currentStep + 1} of {timeline.length}</div>
-                    </div>
-                );
-            };
-
-            return (
-                <div style={{ padding: '20px' }}>
-                    <h1>Agent DVR - Episode Replay</h1>
-                    
-                    <div>
-                        <h2>Episodes</h2>
-                        {episodes.map(ep => (
-                            <div key={ep.episode_id} style={{ margin: '10px 0', padding: '10px', border: '1px solid #ddd' }}>
-                                <button onClick={() => loadEpisode(ep.episode_id)}>
-                                    {ep.agent_name} - {ep.start_time} ({ep.event_count} steps)
-                                </button>
-                                <span style={{ marginLeft: '10px', color: '#666' }}>
-                                    ${(ep.total_cost_cents / 100).toFixed(2)} | {ep.total_tokens} tokens
-                                </span>
-                            </div>
-                        ))}
-                    </div>
-
-                    {selectedEpisode && (
-                        <div>
-                            <h2>Timeline Scrubber</h2>
-                            <TimelineScrubber 
-                                timeline={timeline} 
-                                onStepSelect={(step) => loadStepDetail(selectedEpisode, step)}
-                            />
-                            
-                            {stepDetail && (
-                                <div className="step-detail">
-                                    <h3>Step {currentStep + 1}: {stepDetail.event_type}</h3>
-                                    <p><strong>Duration:</strong> {stepDetail.duration_ms}ms</p>
-                                    <p><strong>Tokens:</strong> {stepDetail.tokens_used}</p>
-                                    <p><strong>Cost:</strong> ${(stepDetail.cost_cents / 100).toFixed(3)}</p>
-                                    <pre>{JSON.stringify(stepDetail.content, null, 2)}</pre>
-                                </div>
-                            )}
-                        </div>
-                    )}
-                </div>
-            );
-        };
-
-        ReactDOM.render(<AgentDVR />, document.getElementById('dvr-root'));
+            });
+        }
+        
+        function playEpisode() {
+            isPlaying = true;
+            document.getElementById('playback-status').textContent = 'Playing';
+            
+            playbackTimer = setInterval(() => {
+                if (currentCall < {{ timeline|length }}) {
+                    scrubToCall(currentCall);
+                    currentCall++;
+                } else {
+                    pauseEpisode();
+                }
+            }, 2000);
+        }
+        
+        function pauseEpisode() {
+            isPlaying = false;
+            document.getElementById('playback-status').textContent = 'Paused';
+            if (playbackTimer) {
+                clearInterval(playbackTimer);
+            }
+        }
+        
+        function stopEpisode() {
+            pauseEpisode();
+            currentCall = 0;
+            document.getElementById('playback-status').textContent = 'Stopped';
+            updateMarkers();
+        }
     </script>
 </body>
 </html>
 ```
 
-## Pitfalls: What Breaks and How to Handle It
+## Pitfalls: What Will Break and How to Handle It
 
-### 1. Database Lock Contention
-Recording every agent step means frequent database writes. SQLite will lock up under concurrent agent runs.
+### 1. Memory Overflow on Large Episodes
+**Problem**: Episodes with 1000+ LLM calls will kill your browser and your database.
 
-**Solution**: Use connection pooling and batch writes:
-
-```python
-import queue
-import threading
-from contextlib import contextmanager
-
-class BatchingRecorder(EpisodeRecorder):
-    def __init__(self, *args, batch_size=100, flush_interval=5):
-        super().__init__(*args)
-        self.batch_size = batch_size
-        self.flush_interval = flush_interval
-        self.event_queue = queue.Queue()
-        self.batch_thread = threading.Thread(target=self._batch_processor, daemon=True)
-        self.batch_thread.start()
-    
-    def _batch_processor(self):
-        batch = []
-        while True:
-            try:
-                event = self.event_queue.get(timeout=self.flush_interval)
-                batch.append(event)
-                
-                if len(batch) >= self.batch_size:
-                    self._flush_batch(batch)
-                    batch = []
-            except queue.Empty:
-                if batch:
-                    self._flush_batch(batch)
-                    batch = []
-    
-    def _flush_batch(self, events):
-        conn = sqlite3.connect(self.db_path)
-        conn.executemany("""
-            INSERT INTO events (event_id, episode_id, timestamp, event_type, ...)
-            VALUES (?, ?, ?, ?, ...)
-        """, [(e.event_id, e.episode_id, ...) for e in events])
-        conn.commit()
-        conn.close()
-```
-
-### 2. Memory Explosion from Large Conversations
-Long agent conversations create massive content payloads. A 200-step reasoning chain will blow up your database.
-
-**Solution**: Compress and chunk large content:
+**Solution**: Implement pagination and lazy loading:
 
 ```python
-import gzip
-import json
-
-def compress_content(content: Dict) -> bytes:
-    json_str = json.dumps(content)
-    return gzip.compress(json_str.encode())
-
-def decompress_content(compressed: bytes) -> Dict:
-    json_str = gzip.decompress(compressed).decode()
-    return json.loads(json_str)
+def get_episode_timeline(self, episode_id: str, 
+                        offset: int = 0, limit: int = 100) -> Dict:
+    conn = sqlite3.connect(self.db_path)
+    
+    # Get total count
+    total_calls = conn.execute("""
+        SELECT COUNT(*) FROM episode_calls WHERE episode_id = ?
+    """, (episode_id,)).fetchone()[0]
+    
+    # Get paginated results
+    cursor = conn.execute("""
+        SELECT * FROM episode_calls 
+        WHERE episode_id = ? 
+        ORDER BY sequence ASC
+        LIMIT ? OFFSET ?
+    """, (episode_id, limit, offset))
+    
+    return {
+        'timeline': [dict(row) for row in cursor.fetchall()],
+        'total_calls': total_calls,
+        'has_more': offset + limit < total_calls
+    }
 ```
 
-### 3. Timeline Scrubber Performance
-Loading 500+ events in the frontend will kill the browser. The timeline becomes unusable.
+### 2. Context Window Reconstruction Hell
+**Problem**: Your agent's context window evolves throughout the episode, but you're only storing individual requests.
 
-**Solution**: Virtual scrolling and event aggregation:
+**Solution**: Store conversation state at each checkpoint:
 
-```javascript
-const useVirtualTimeline = (events, viewportWidth = 1000) => {
-    const eventsPerPixel = events.length / viewportWidth;
-    const aggregatedEvents = React.useMemo(() => {
-        if (eventsPerPixel <= 1) return events;
+```python
+@dataclass
+class EpisodeCall:
+    # ... existing fields ...
+    context_window: List[Dict]  # Full conversation history at this point
+    system_prompt: str          # System prompt for this call
+    conversation_id: str        # Link to conversation thread
+```
+
+### 3. Cost Explosion from Storing Everything
+**Problem**: Storing full request/response bodies gets expensive fast.
+
+**Solution**: Implement selective recording with compression:
+
+```python
+class EpisodeRecorder:
+    def __init__(self, 
+                 compress_requests: bool = True,
+                 max_prompt_length: int = 10000,
+                 store_embeddings: bool = False):
+        self.compress_requests = compress_requests
+        self.max_prompt_length = max_prompt_length
+        self.store_embeddings = store_embeddings
+    
+    def _compress_request(self, request_body: Dict) -> Dict:
+        if self.compress_requests:
+            # Truncate very long prompts
+            if 'messages' in request_body:
+                for msg in request_body['messages']:
+                    if len(msg.get('content', '')) > self.max_prompt_length:
+                        msg['content'] = msg['content'][:self.max_prompt_length] + "... [truncated]"
         
-        // Aggregate events into pixels
-        const aggregated = [];
-        for (let i = 0; i < viewportWidth; i++) {
-            const start = Math.floor(i * eventsPerPixel);
-            const end = Math.floor((i + 1) * eventsPerPixel);
-            const slice = events.slice(start, end);
-            
-            aggregated.push({
-                pixel: i,
-                events: slice,
-                primaryType: slice[0]?.event_type,
-                totalCost: slice.reduce((sum, e) => sum + e.cost_cents, 0)
-            });
-        }
-        return aggregated;
-    }, [events, eventsPerPixel]);
+        return request_body
+```
+
+## Measurement: How to Know It's Working
+
+Your DVR is working when debugging changes from this:
+
+```bash
+# Before
+tail -f agent.log | grep ERROR
+# Stares at logs for 20 minutes
+# Gives up and hopes for the best
+```
+
+To this:
+
+```bash
+# After
+# Opens DVR interface
+# Scrubs to call #23 where things went wrong
+# Sees exact prompt and response
+# Identifies the issue in 30 seconds
+# Fixes the problem
+```
+
+**Key metrics to track:**
+- **Mean Time to Debug (MTTD)**: How long from "something's wrong" to "found the issue"
+- **Debug success rate**: Percentage of issues resolved without "try random changes"
+- **Context reconstruction accuracy**: Can you rebuild the agent's state at any point?
+
+**Health checks for your DVR:**
+```python
+def health_check():
+    recorder = EpisodeRecorder()
     
-    return aggregated
+    # Can we record a test episode?
+    episode_id = recorder.start_episode("Health Check")
+    
+    # Can we retrieve it?
+    scrubber = TimelineScrubber()
+    timeline = scrubber.get_episode_timeline(episode_id)
+    
+    # Can we scrub to specific calls?
+    assert scrubber.scrub_to_call(episode_id, 0) is not None
+    
+    print("✅ DVR is healthy")
+```
+
+## Next Steps: From DVR to AI Agent Debugging Mastery
+
+You now have a working DVR for AI agent conversations. But this is just the foundation. The real power comes when you integrate this with your actual agent workflows.
+
+**Try the complete implementation:**
+- 🔧 [Clone the demo repo](https://github.com/airblackbox/agent-dvr-tutorial) with working code
+- 📚 [Read the Airblackbox docs](https://docs.airblackbox.ai) for production integration  
+- 🚀 [Set up the Gateway](https://docs.airblackbox.ai/gateway) to start recording your agents automatically
+
+The difference between debugging AI agents with logs vs. with a DVR is the difference between reading a screenplay and watching the actual movie. Your agents are telling stories —
